@@ -25,6 +25,13 @@ export interface RainfallRecord {
   river_discharge: number;
 }
 
+export interface ForecastRecord {
+  date: string;
+  rainfall_mm: number;
+  river_discharge: number;
+  confidence: number;
+}
+
 export type RiskLevel = 'Low' | 'Medium' | 'High';
 
 export function getRiskLevel(rainfall: number, discharge: number): RiskLevel {

@@ -8,7 +8,7 @@ import {
   Droplets, Thermometer, Search, Mail
 } from 'lucide-react';
 import KeralaMap from './Map';
-import { Panchayat, DistrictSummary, RainfallRecord, getRiskLevel, getRiskColor } from '../types';
+import { Panchayat, DistrictSummary, RainfallRecord, ForecastRecord, getRiskLevel, getRiskColor } from '../types';
 import { motion, AnimatePresence } from 'motion/react';
 
 type Tab = 'Dashboard' | 'Districts' | 'Risk Map' | 'Community' | 'SDG Impact' | 'AI Insights' | 'Live Alerts';
@@ -19,6 +19,7 @@ export default function Dashboard() {
   const [selectedDistrict, setSelectedDistrict] = useState<string>('');
   const [selectedId, setSelectedId] = useState<number | undefined>();
   const [history, setHistory] = useState<RainfallRecord[]>([]);
+  const [forecast, setForecast] = useState<ForecastRecord[]>([]);
   const [aiAnalysis, setAiAnalysis] = useState<string>('');
   const [loading, setLoading] = useState(true);
   const [analyzing, setAnalyzing] = useState(false);
@@ -27,6 +28,7 @@ export default function Dashboard() {
   const [showSubscribe, setShowSubscribe] = useState(false);
   const [email, setEmail] = useState('');
   const [subscribing, setSubscribing] = useState(false);
+  const [automationRunning, setAutomationRunning] = useState(false);
 
   useEffect(() => {
     fetch('/api/district-summaries')
@@ -56,6 +58,12 @@ export default function Dashboard() {
       fetch(`/api/history/${selectedId}`)
         .then(res => res.json())
         .then(setHistory);
+      fetch(`/api/forecast/${selectedId}?days=30`)
+        .then(res => res.json())
+        .then(data => setForecast(data.forecast || []));
+    } else {
+      setHistory([]);
+      setForecast([]);
     }
   }, [selectedId]);
 
@@ -86,13 +94,16 @@ export default function Dashboard() {
         body: JSON.stringify({ panchayat_id: selectedId, email, risk_threshold: 'High' })
       });
       if (res.ok) {
-        alert('Successfully subscribed to alerts!');
+        setAutomationRunning(true);
+        await fetch('/api/alerts/run', { method: 'POST' });
+        alert('Successfully subscribed. Email automation run triggered for this cycle.');
         setShowSubscribe(false);
         setEmail('');
       }
     } catch (err) {
       console.error(err);
     } finally {
+      setAutomationRunning(false);
       setSubscribing(false);
     }
   };
@@ -100,6 +111,19 @@ export default function Dashboard() {
   const selectedDistrictData = districts.find(d => d.name === selectedDistrict);
   const selectedPanchayat = panchayats.find(p => p.id === selectedId);
   const highRiskCount = panchayats.filter(p => getRiskLevel(p.latest_rainfall, p.latest_discharge) === 'High').length;
+  const monthlyProjectionPeak = forecast.reduce((max, point) => Math.max(max, point.rainfall_mm), 0);
+  const rainfallTimeline = [
+    ...history.map(point => ({
+      date: point.date,
+      observed_rainfall: point.rainfall_mm,
+      projected_rainfall: null as number | null
+    })),
+    ...forecast.map(point => ({
+      date: point.date,
+      observed_rainfall: null as number | null,
+      projected_rainfall: point.rainfall_mm
+    }))
+  ];
 
   if (loading && districts.length === 0) return (
     <div className="h-screen flex items-center justify-center bg-[#050506] font-mono text-emerald-500">
@@ -429,16 +453,16 @@ export default function Dashboard() {
                             
                             <div className="p-4 rounded-xl bg-emerald-500/5 border border-emerald-500/10">
                               <p className="text-[11px] text-slate-400 leading-relaxed">
-                                <span className="text-emerald-500 font-bold uppercase">Automation Logic:</span> System will trigger high-priority alerts when precipitation exceeds 120mm or river discharge crosses safety thresholds.
+                                <span className="text-emerald-500 font-bold uppercase">Automation Logic:</span> A scheduled automation run evaluates real-time telemetry + 30-day forecast and emails you once configured risk levels are exceeded.
                               </p>
                             </div>
 
                             <button 
                               onClick={handleSubscribe}
-                              disabled={subscribing || !email}
+                              disabled={subscribing || automationRunning || !email}
                               className="w-full py-4 bg-emerald-500 hover:bg-emerald-400 text-black font-bold uppercase text-xs rounded-xl transition-all disabled:opacity-50 shadow-[0_0_20px_rgba(16,185,129,0.2)]"
                             >
-                              {subscribing ? 'Initializing...' : 'Activate Alert Triggers'}
+                              {subscribing || automationRunning ? 'Initializing...' : 'Activate Alert Triggers'}
                             </button>
                           </div>
                         </motion.div>
@@ -602,7 +626,7 @@ export default function Dashboard() {
                       </div>
                       <div className="h-72 w-full">
                         <ResponsiveContainer width="100%" height="100%">
-                          <AreaChart data={history}>
+                          <AreaChart data={rainfallTimeline}>
                             <defs>
                               <linearGradient id="colorRain" x1="0" y1="0" x2="0" y2="1">
                                 <stop offset="5%" stopColor="#10B981" stopOpacity={0.2}/>
@@ -616,10 +640,14 @@ export default function Dashboard() {
                               contentStyle={{ backgroundColor: '#0D0E11', border: '1px solid rgba(255,255,255,0.05)', borderRadius: '8px', fontSize: '10px', fontFamily: 'JetBrains Mono' }}
                               labelFormatter={(label) => new Date(label).toLocaleDateString()}
                             />
-                            <Area type="monotone" dataKey="rainfall_mm" stroke="#10B981" fillOpacity={1} fill="url(#colorRain)" strokeWidth={2.5} />
+                            <Area type="monotone" dataKey="observed_rainfall" stroke="#10B981" fillOpacity={1} fill="url(#colorRain)" strokeWidth={2.5} connectNulls />
+                            <Line type="monotone" dataKey="projected_rainfall" stroke="#60A5FA" strokeWidth={2} strokeDasharray="5 5" dot={false} connectNulls />
                           </AreaChart>
                         </ResponsiveContainer>
                       </div>
+                      <p className="mt-4 text-[10px] uppercase tracking-[0.2em] text-slate-500">
+                        30-Day projected rainfall peak: <span className="text-blue-400 font-bold">{monthlyProjectionPeak.toFixed(1)}mm</span>
+                      </p>
                     </div>
                   )}
                 </div>
