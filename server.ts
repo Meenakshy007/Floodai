@@ -3,8 +3,109 @@ import { createServer as createViteServer } from "vite";
 import path from "path";
 import { GoogleGenAI } from "@google/genai";
 import Database from "better-sqlite3";
+import { spawn } from "node:child_process";
 
 const db = new Database("floodguard_v4.db");
+
+type HistoryRow = {
+  date: string;
+  rainfall_mm: number;
+  river_discharge: number;
+};
+
+type ProjectionPoint = {
+  date: string;
+  rainfall_mm: number;
+  river_discharge: number;
+  confidence: number;
+};
+
+function clamp(value: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function buildMonthlyForecast(history: HistoryRow[], days = 30): ProjectionPoint[] {
+  if (history.length === 0) {
+    return [];
+  }
+
+  const sortedHistory = [...history].sort((a, b) => a.date.localeCompare(b.date));
+  const avgRainfall = sortedHistory.reduce((sum, row) => sum + row.rainfall_mm, 0) / sortedHistory.length;
+  const avgDischarge = sortedHistory.reduce((sum, row) => sum + row.river_discharge, 0) / sortedHistory.length;
+  const rainfallSlope = sortedHistory.length > 1
+    ? (sortedHistory[sortedHistory.length - 1].rainfall_mm - sortedHistory[0].rainfall_mm) / (sortedHistory.length - 1)
+    : 0;
+  const dischargeSlope = sortedHistory.length > 1
+    ? (sortedHistory[sortedHistory.length - 1].river_discharge - sortedHistory[0].river_discharge) / (sortedHistory.length - 1)
+    : 0;
+
+  const lastPoint = sortedHistory[sortedHistory.length - 1];
+  const startDate = new Date(lastPoint.date);
+
+  return Array.from({ length: days }, (_, index) => {
+    const nextDate = new Date(startDate);
+    nextDate.setDate(startDate.getDate() + index + 1);
+
+    // simple trend + short-cycle monsoon seasonality
+    const seasonalSignal = Math.sin((index + 1) / 3) * 8;
+    const projectedRainfall = clamp(
+      lastPoint.rainfall_mm + rainfallSlope * (index + 1) + seasonalSignal + avgRainfall * 0.05,
+      0,
+      280
+    );
+    const projectedDischarge = clamp(
+      lastPoint.river_discharge + dischargeSlope * (index + 1) + seasonalSignal * 1.6 + avgDischarge * 0.04,
+      0,
+      350
+    );
+
+    return {
+      date: nextDate.toISOString().split("T")[0],
+      rainfall_mm: Number(projectedRainfall.toFixed(2)),
+      river_discharge: Number(projectedDischarge.toFixed(2)),
+      confidence: Number(clamp(0.95 - index * 0.018, 0.35, 0.95).toFixed(2))
+    };
+  });
+}
+
+function getRiskLevel(rainfall: number, discharge: number): "Low" | "Medium" | "High" {
+  const score = (rainfall / 150) * 0.6 + (discharge / 200) * 0.4;
+  if (score > 0.7) return "High";
+  if (score > 0.4) return "Medium";
+  return "Low";
+}
+
+function levelToRank(level: string): number {
+  return level === "High" ? 3 : level === "Medium" ? 2 : 1;
+}
+
+async function sendAlertEmail(to: string, subject: string, text: string) {
+  const from = process.env.ALERT_FROM_EMAIL || "alerts@floodguard.local";
+  const emailPayload = [`From: ${from}`, `To: ${to}`, `Subject: ${subject}`, "", text].join("\n");
+
+  await new Promise<void>((resolve) => {
+    const proc = spawn("sendmail", ["-t", "-i"]);
+
+    proc.on("error", () => {
+      console.warn("sendmail unavailable, writing alert payload to logs for automation visibility.");
+      console.log(emailPayload);
+      resolve();
+    });
+
+    proc.on("close", (code) => {
+      if (code === 0) {
+        console.log(`Alert email sent to ${to} using local sendmail.`);
+      } else {
+        console.warn(`sendmail exited with status ${code}; alert payload logged instead.`);
+        console.log(emailPayload);
+      }
+      resolve();
+    });
+
+    proc.stdin.write(emailPayload);
+    proc.stdin.end();
+  });
+}
 
 // Initialize DB with synthetic data for Kerala Panchayats
 db.exec(`
@@ -438,6 +539,15 @@ async function startServer() {
       risk_threshold TEXT DEFAULT 'High',
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY(panchayat_id) REFERENCES panchayats(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS alert_dispatch_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      subscription_id INTEGER,
+      risk_level TEXT,
+      forecast_peak REAL,
+      sent_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(subscription_id) REFERENCES alert_subscriptions(id)
     )
   `);
 
@@ -448,7 +558,7 @@ async function startServer() {
     }
     try {
       db.prepare("INSERT INTO alert_subscriptions (panchayat_id, email, risk_threshold) VALUES (?, ?, ?)").run(panchayat_id, email, risk_threshold || 'High');
-      res.json({ status: "ok", message: "Successfully subscribed to alerts" });
+      res.json({ status: "ok", message: "Successfully subscribed to alerts", automation: "Use POST /api/alerts/run to execute automated email checks." });
     } catch (err) {
       res.status(500).json({ error: "Subscription failed" });
     }
@@ -505,6 +615,85 @@ async function startServer() {
       ORDER BY date ASC
     `).all(req.params.panchayatId);
     res.json(data);
+  });
+
+
+  app.get("/api/forecast/:panchayatId", (req, res) => {
+    const days = Number(req.query.days || 30);
+    const boundedDays = clamp(days, 7, 30);
+    const history = db.prepare(`
+      SELECT date, rainfall_mm, river_discharge FROM rainfall_data
+      WHERE panchayat_id = ?
+      ORDER BY date ASC
+    `).all(req.params.panchayatId) as HistoryRow[];
+
+    if (history.length === 0) {
+      return res.status(404).json({ error: "Panchayat history not found" });
+    }
+
+    const forecast = buildMonthlyForecast(history, boundedDays);
+    return res.json({
+      panchayat_id: Number(req.params.panchayatId),
+      horizon_days: boundedDays,
+      forecast
+    });
+  });
+
+  app.post("/api/alerts/run", async (_req, res) => {
+    try {
+      const subscriptions = db.prepare(`
+        SELECT s.id, s.email, s.risk_threshold, s.panchayat_id, p.name as panchayat_name, p.district,
+               r.rainfall_mm as latest_rainfall, r.river_discharge as latest_discharge
+        FROM alert_subscriptions s
+        JOIN panchayats p ON p.id = s.panchayat_id
+        JOIN rainfall_data r ON r.panchayat_id = s.panchayat_id
+        WHERE r.date = (SELECT MAX(date) FROM rainfall_data)
+      `).all() as any[];
+
+      let sent = 0;
+      for (const subscription of subscriptions) {
+        const history = db.prepare(`
+          SELECT date, rainfall_mm, river_discharge FROM rainfall_data
+          WHERE panchayat_id = ? ORDER BY date ASC
+        `).all(subscription.panchayat_id) as HistoryRow[];
+
+        const forecast = buildMonthlyForecast(history, 30);
+        const forecastPeak = forecast.reduce((max, point) => Math.max(max, point.rainfall_mm), 0);
+        const maxDischarge = forecast.reduce((max, point) => Math.max(max, point.river_discharge), 0);
+        const currentRisk = getRiskLevel(subscription.latest_rainfall, subscription.latest_discharge);
+        const forecastRisk = getRiskLevel(forecastPeak, maxDischarge);
+        const effectiveRisk = levelToRank(forecastRisk) > levelToRank(currentRisk) ? forecastRisk : currentRisk;
+
+        if (levelToRank(effectiveRisk) < levelToRank(subscription.risk_threshold || "High")) {
+          continue;
+        }
+
+        await sendAlertEmail(
+          subscription.email,
+          `FloodGuard ${effectiveRisk} Alert • ${subscription.panchayat_name}`,
+          [
+            `Panchayat: ${subscription.panchayat_name}, ${subscription.district}`,
+            `Current rainfall: ${subscription.latest_rainfall.toFixed(1)} mm`,
+            `Current discharge: ${subscription.latest_discharge.toFixed(1)} m3/s`,
+            `30-day forecast rainfall peak: ${forecastPeak.toFixed(1)} mm`,
+            `Forecast confidence (day 1/day 30): ${forecast[0]?.confidence ?? 0}/${forecast[29]?.confidence ?? 0}`,
+            `Assessed risk level: ${effectiveRisk}`,
+            `Recommendation: Prepare local response teams and verify evacuation channels.`
+          ].join("\n")
+        );
+
+        db.prepare(`
+          INSERT INTO alert_dispatch_log (subscription_id, risk_level, forecast_peak)
+          VALUES (?, ?, ?)
+        `).run(subscription.id, effectiveRisk, forecastPeak);
+        sent += 1;
+      }
+
+      res.json({ status: "ok", subscriptions: subscriptions.length, sent });
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: "Alert automation run failed" });
+    }
   });
 
   app.post("/api/analyze", async (req, res) => {

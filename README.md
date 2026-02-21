@@ -18,3 +18,8 @@ View your app in AI Studio: https://ai.studio/apps/3cbc437f-34b7-4ace-be94-6d5c4
 2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
 3. Run the app:
    `npm run dev`
+
+## New automation features
+
+- Email alert automation: Subscribe from the dashboard and execute `POST /api/alerts/run` to trigger rule-based notifications for current + forecasted risk.
+- 1-month projection: `GET /api/forecast/:panchayatId?days=30` returns a 30-day rainfall/discharge forecast with confidence values.
