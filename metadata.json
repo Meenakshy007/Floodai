@@ -1,0 +1,5 @@
+{
+  "name": "FloodGuard AI",
+  "description": "AI-powered flood prediction and alert system for Kerala, providing real-time risk assessment and interactive mapping.",
+  "requestFramePermissions": ["geolocation"]
+}
